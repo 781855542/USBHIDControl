@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -6,6 +6,8 @@ using System.Threading.Tasks;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 using System.IO;
+using System.Threading;
+//using System.Windows.Forms;
 namespace USBHIDControl
 {
     /// <summary>
@@ -266,6 +268,7 @@ namespace USBHIDControl
                 if (!ret) continue;
 
 
+
                 /* 获取接口设备的详细信息,第一次会失败,但是能返回正确的信息缓冲区大小 */
                 int buffsize = 0;
                 ret = SetupDiGetDeviceInterfaceDetail
@@ -301,7 +304,7 @@ namespace USBHIDControl
                 {
                     /* 获取设备地址 */
                     string str = Marshal.PtrToStringAuto((IntPtr)((int)pDetail + 4));
-
+                    
                     //创建并打开设备
                     IntPtr ptr = CreateFile
                         (
@@ -316,7 +319,6 @@ namespace USBHIDControl
                     if(ptr == IntPtr.Zero)
                     {
                         /* 无法打开该设备,可能是鼠标等系统独占设备或者设备不存在 */
-                        
                         continue;
                     }
 
@@ -361,7 +363,7 @@ namespace USBHIDControl
 
                     _OutputReportLength = caps.OutputReportByteLength;
                     _InputReportLength = caps.InputReportByteLength;
-
+                    
                     /* 创建读写流,没有这个代码,接下来的读写就不能进行 */
                     HIDdevice = new FileStream
                         (
@@ -371,6 +373,9 @@ namespace USBHIDControl
                         true                            //异步模式
                         );
                     Marshal.FreeHGlobal(pDetail);//释放占用的内存
+                    /* 开启异步接收 */
+                    //BeginAsyncRead();
+                    index = 128;//结束循环
                 }
             }
             SetupDiDestroyDeviceInfoList(ALLdevice);
@@ -395,9 +400,9 @@ namespace USBHIDControl
             IntPtr ptr = CreateFile
                 (
                 DevicePath,                             // 文件名
-                GENERIC_READ | GENERIC_WRITE,           // 访问模式
-                FILE_SHARE_READ | FILE_SHARE_WRITE,     // 共享模式
-                0,                                      // 安全属性
+                GENERIC_READ | GENERIC_WRITE,           // 访问模式 读写
+                FILE_SHARE_READ | FILE_SHARE_WRITE,     // 共享模式 共享读写
+                0,                                      // 安全属性 
                 OPEN_EXISTING,                          // 如何创建
                 FILE_FLAG_OVERLAPPED,                   // 文件属性
                 0                                       // 模板文件的句柄
@@ -452,6 +457,8 @@ namespace USBHIDControl
                 true                            //异步模式
                 );
 
+            /* 开启异步接收 */
+            BeginAsyncRead();
         }
         
         
@@ -525,9 +532,23 @@ namespace USBHIDControl
         /// <summary>
         /// 是否保存接收到的数据包到缓存
         /// </summary>
-        public bool SaveReportToBuffer { get; set; }
+        public bool SaveReportToBuffer
 
-       
+        {
+            get
+            {
+                return _SaveReportToBuffer;
+            }
+            set
+            {
+                _ReadyToRead = false;
+                ReadReportList.Clear();
+                _ReportToRead = 0;
+                _SaveReportToBuffer = value;
+            }
+        }
+        private bool _SaveReportToBuffer = false;
+
         /// <summary>
         /// HID读取缓冲区大小,表示为正常数据报告的数量,并非字节数
         /// </summary>
@@ -538,7 +559,17 @@ namespace USBHIDControl
         /// </summary>
         public int WriteBufferSize { get; set; } = 128;
 
-
+        /// <summary>
+        /// 是否有数据已经准备好
+        /// </summary>
+        public bool ReadyToRead
+        {
+            get
+            {
+                return _ReadyToRead;
+            }
+        }
+        private bool _ReadyToRead = false;
 
         private FileStream HIDdevice = null;
         private List<Report> ReadReportList = new List<Report>();
@@ -565,20 +596,151 @@ namespace USBHIDControl
         /// <summary>
         /// 从USBHID设备读出数据,
         /// </summary>
-        /// <returns>读取成功返回true,读取失败返回false,并能通过ErrorCode获取错误代码</returns>
-        public bool Read()
+        /// <param name="buf">存放读取出来数据的缓存</param>
+        /// <returns>读取成功返回读取报告数量,读取失败返回-1,并能通过ErrorCode获取错误代码</returns>
+        public int Read(ref List<Report> buf)
         {
-            bool ret = false;
             _ErrorCode = string.Empty;
+
+            if(_SaveReportToBuffer == false)
+            {
+                throw new Exception("未开启保存数据到缓存功能");
+            }
+            if(ReadReportList.Count==0) //
+            {
+                throw new Exception("缓冲区中无数据,为避免出现本异常,在读取之前请检查ReadyToRead属性是否为true");
+            }
+            lock (ReadReportList)
+            {
+                buf.AddRange(ReadReportList);
+                ReadReportList.Clear();//清除缓冲区
+                _ReadyToRead = false;
+            }
             //TODO:添加读取数据功能
-            return ret;
+            return buf.Count;
+        }
+        /// <summary>
+        /// 从USBHID设备读出数据
+        /// </summary>
+        /// <param name="buf">存放读取出来数据的缓存</param>
+        /// <param name="timeout">读取时间(ms),绝对延时,在时间到之前将保持阻塞状态</param>
+        /// <returns>读取到的数据包的数量</returns>
+        public int Read (ref List<Report> buf,int timeout)
+        {
+            if (timeout<20)
+            {
+                throw new Exception("参数timeout太小,无效数据");
+            }
+            DateTime times = DateTime.Now;
+            TimeSpan dt = DateTime.Now - times;
+            List<Report> tbuff = new List<Report>();
+            buf.Clear();
+            while (dt.Milliseconds < timeout)
+            {
+                if(_ReadyToRead)
+                {
+                    tbuff.Clear();
+                    Read(ref tbuff);
+                    buf.AddRange(tbuff);
+                }
+                dt = DateTime.Now - times;//更新时间
+            }
+            return  buf.Count;
+        }
+        /// <summary>
+        /// 从USBHID设备读出数据
+        /// </summary>
+        /// <param name="buf">存放读取出来数据的缓存</param>
+        /// <param name="timeout">读取时间(ms),绝对延时,在时间到之前将保持阻塞状态</param>
+        /// <param name="reportnumber">读取数据包的最大数量</param>
+        /// <returns>读取到的数据包的数量</returns>
+        public int Read(ref List<Report> buf, int timeout,int reportnumber)
+        {
+            if (timeout < 20)
+            {
+                throw new Exception("参数timeout太小,无效数据,最小值为20");
+            }
+            if (reportnumber < 1)
+            {
+                throw new Exception("参数reportnumber太小,无效数据");
+            }
+            DateTime times = DateTime.Now;
+            TimeSpan dt = DateTime.Now - times;
+            List<Report> tbuff = new List<Report>();
+            buf.Clear();
+            while (dt.Milliseconds < timeout )
+            {
+                if (_ReadyToRead)
+                {
+                    tbuff.Clear();
+                    Read(ref tbuff);
+                    buf.AddRange(tbuff);
+                    if (buf.Count >= reportnumber)
+                        break;
+                }
+                /* 更新超时检测时间 */
+                dt = DateTime.Now - times;//更新时间
+            }
+            return buf.Count;
+        }
+        /// <summary>
+        /// 从USBHID设备读出一个数据包数据
+        /// </summary>
+        /// <param name="report">存放一个数据包的缓存</param>
+        /// <returns></returns>
+        public int Read(ref Report report)
+        {
+            if (_ReadyToRead)
+            {
+                report = ReadReportList[0];
+                ReadReportList.RemoveAt(0);
+
+                _ReportToRead = ReadReportList.Count;
+
+                if (_ReportToRead == 0) _ReadyToRead = false;
+                return 1;
+            }
+            return 0;
+        }
+        /// <summary>
+        /// 从USBHID设备读出一个数据包数据
+        /// </summary>
+        /// <param name="report">存放一个数据包的缓存</param>
+        /// <param name="timeout">超时等待时间</param>
+        /// <returns></returns>
+        public int Read(ref Report report,int timeout)
+        {
+            if (timeout < 20)
+            {
+                throw new Exception("参数timeout太小,无效数据,最小值为20");
+            }
+            DateTime times = DateTime.Now;
+            TimeSpan dt = DateTime.Now - times;
+            List<Report> tbuff = new List<Report>();
+
+            while (dt.Milliseconds < timeout)
+            {
+                if (_ReadyToRead)
+                {
+                    report = ReadReportList[0];
+                    ReadReportList.RemoveAt(0);
+
+                    _ReportToRead = ReadReportList.Count;
+
+                    if (_ReportToRead == 0) _ReadyToRead = false;
+                    return 1;
+                }
+                /* 更新超时检测时间 */
+                dt = DateTime.Now - times;//更新时间
+            }
+            return 0;
         }
         /// <summary>
         /// 向USBHID设备写入数据
         /// </summary>
         /// <param name="buffer">要写的数组</param>
         /// <returns>写入成功返回true,写入失败返回false,并能通过ErrorCode获取错误代码</returns>
-        public void Write(byte[] buffer)
+        public bool Write(byte[] buffer)
         {
             _ErrorCode = string.Empty;
             if(!_IsOpen)
@@ -586,7 +748,7 @@ namespace USBHIDControl
                 _ErrorCode = "设备当前处于关闭状态,不能发送数据";
                 throw new Exception(_ErrorCode);
             }
-            if (buffer.Length != OutputReportLength)
+            if (buffer.Length != _OutputReportLength)
             {
                 _ErrorCode = "数组长度与HID设备硬件描述符不一致,会导致发送失败";
                 throw new Exception(_ErrorCode);
@@ -595,16 +757,85 @@ namespace USBHIDControl
             try
             {
                 HIDdevice.Write(buffer, 0, _OutputReportLength);
+                return true;
             }
             catch(Exception ex)
             {
                 _ErrorCode = ex.Message;
+                return false;
             }
 
             //TODO:添加发送数据功能
         }
+        /// <summary>
+        /// 向USBHID设备写入数据
+        /// </summary>
+        /// <param name="report">要写入的数据</param>
+        /// <returns>写入成功返回true,写入失败返回false,并能通过ErrorCode获取错误代码</returns>
+        public bool Write(Report report)
+        {
+            _ErrorCode = string.Empty;
+            byte[] buffer = new byte[_OutputReportLength];
 
+            buffer[0] = report.ReportID;
+            int i = 1;
+            try
+            {
+                foreach (byte b in report.ReportBuff)
+                {
+                    buffer[i++] = b;
+                }
+            }
+            catch
+            {
+                throw new Exception("数据包的大小不匹配,应该为OutputReportLength的值");
+            }
+            return Write(buffer);
+        }
+        /// <summary>
+        /// 向USBHID设备写入数据
+        /// </summary>
+        /// <param name="report">要写入的数据列表</param>
+        /// <returns>写入成功返回true,写入失败返回false,并能通过ErrorCode获取错误代码</returns>
+        public bool Write(List<Report> report)
+        {
+            try
+            {
+                foreach (Report rep in report)
+                {
+                    Write(rep);
+                }
+            }
+            catch(Exception ex)
+            {
 
+                throw new Exception(ex.Message);
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 向USBHID设备写入数据
+        /// </summary>
+        /// <param name="report">要写入的数据列表</param>
+        /// <param name="interval">发送每个数据包的间隔时间(ms)</param>
+        /// <returns>写入成功返回true,写入失败返回false,并能通过ErrorCode获取错误代码</returns>
+        public bool Write(List<Report> report,int interval)
+        {
+            try
+            {
+                foreach (Report rep in report)
+                {
+                    Write(rep);
+                    Thread.Sleep(interval);
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new Exception(ex.Message);
+            }
+            return true;
+        }
 
         #region 自定义事件
 
@@ -669,61 +900,82 @@ namespace USBHIDControl
                     reportData[i - 1] = readBuff[i];
                 Report e = new Report(readBuff[0], reportData);
 
+                //MessageBox.Show("shuju ");
+                /* 发出数据到达消息 */
+                OnDataReceived(e); 
+                
                 /* 记录数据包到缓存 */
-                if (SaveReportToBuffer)
+                if (_SaveReportToBuffer)
                 {
+                    /* 添加数据到缓冲区 */
                     ReadReportList.Add(e);
+                    /* 限制缓冲区数据量 */
                     if (ReadReportList.Count > ReadBufferSize)//缓冲区数据量太多
                     {
                         ReadReportList.RemoveRange(0, ReadReportList.Count - ReadBufferSize);
                     }
+                    /* 记录可读取的字节数 */
                     _ReportToRead = ReadReportList.Count;
+                    /* 标记已经可以进行读操作 */
+                    _ReadyToRead = true;
 
                 }
-                /* 发出数据到达消息 */
-                OnDataReceived(e); 
                 /* 启动下一次读操作 */
                 BeginAsyncRead();
             }
             catch (IOException)//读写错误,设备已经被移除
             {
+                /* 发出设备移除消息 */
                 EventArgs ex = new EventArgs();
-                OnDeviceRemoved(ex);//发出设备移除消息
-                HIDdevice.Close();//关闭读写流
+                OnDeviceRemoved(ex);
+                /* 关闭读写流 */
+                HIDdevice.Close();
             }
         }
+        /// <summary>
+        /// 启动异步读取
+        /// </summary>
         private void BeginAsyncRead()
         {
             /* 如果设备打开 */
             if (_IsOpen)
             {
+                //MessageBox.Show("1");
                 byte[] inputBuff = new byte[_InputReportLength];
-                HIDdevice.BeginRead(inputBuff, 0, _InputReportLength, new AsyncCallback(ReadCompleted), inputBuff);
+                HIDdevice.BeginRead
+                    (
+                    inputBuff,          //数据读入的缓冲区。
+                    0,                  //buffer 中的字节偏移量，从该偏移量开始写入从流中读取的数据。
+                    _InputReportLength, //最多读取的字节数。 
+                    new AsyncCallback(ReadCompleted), //可选的异步回调，在完成读取时调用。
+                    inputBuff           //一个用户提供的对象，它将该特定的异步读取请求与其他请求区别开来。
+                    );
             }
         }
+     
+    }
+    /// <summary>
+    /// 一个HID报告
+    /// </summary>
+    public class Report : EventArgs
+    {
         /// <summary>
-        /// 一个HID报告
+        /// 报告ID
         /// </summary>
-        public class Report : EventArgs
+        public readonly byte ReportID;
+        /// <summary>
+        /// 报告数据
+        /// </summary>
+        public readonly byte[] ReportBuff;
+        /// <summary>
+        /// 创建一个Report对象
+        /// </summary>
+        /// <param name="id">报告ID</param>
+        /// <param name="arrayBuff">报告数据</param>
+        public Report(byte id, byte[] arrayBuff)
         {
-            /// <summary>
-            /// 报告ID
-            /// </summary>
-            public readonly byte ReportID;
-            /// <summary>
-            /// 报告数据
-            /// </summary>
-            public readonly byte[] ReportBuff;
-            /// <summary>
-            /// 创建一个Report对象
-            /// </summary>
-            /// <param name="id">报告ID</param>
-            /// <param name="arrayBuff">报告数据</param>
-            public Report(byte id, byte[] arrayBuff)
-            {
-                ReportID = id;
-                ReportBuff = arrayBuff;
-            }
+            ReportID = id;
+            ReportBuff = arrayBuff;
         }
     }
 }
